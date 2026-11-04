@@ -1946,6 +1946,47 @@ impl<T: Router, O: OutgoingHandler> Ingress<T, O> {
             + self.messaging_handlers.read().await.len()
     }
 
+    /// Deliver `request` to the already-resolved workload `workload_id` in
+    /// process, without going through the TCP listener.
+    ///
+    /// This is the same in-memory path same-host egress uses (see
+    /// [`IngressBuilder::local_routing`]): a workload with a long-lived
+    /// service serving HTTP receives the request on that instance, any other
+    /// takes the per-request component path, and the p2, p3 and pooled-instance
+    /// selection is made there exactly as for a request off the wire. A
+    /// missing `Host` header is filled from the request URI's authority, as
+    /// the wire would carry it.
+    ///
+    /// There is deliberately no routing and no authorization here: the
+    /// [`Router`] is not consulted and `workload_id` is taken as given. It is
+    /// for embedders that do their own routing and authorization first and
+    /// then hand the request to the workload they picked.
+    ///
+    /// Errors when no workload is bound under `workload_id`, when it is bound
+    /// but serves no `wasi:http` handler (it never reached the handle table),
+    /// or when its service instance has stopped. Unlike the listener this does
+    /// not map failures to 404/500 responses; the caller decides that.
+    pub async fn dispatch_request(
+        &self,
+        workload_id: &str,
+        request: hyper::Request<WasiBody>,
+    ) -> anyhow::Result<hyper::Response<WasiBody>> {
+        // Same priority as `handle_http_request`: a service that serves HTTP
+        // wins over the component handle. Awaited reads, not the `try_read` of
+        // `resolve_local_target`, because there is no sync egress path to
+        // protect here and a contended table must not look like an unbound
+        // workload.
+        let service = self.service_handlers.read().await.get(workload_id).cloned();
+        let target = match service {
+            Some(sender) => LocalTarget::Service(sender),
+            None => match self.workload_handles.read().await.get(workload_id).cloned() {
+                Some(handle) => LocalTarget::Component(handle),
+                None => anyhow::bail!("no workload bound to id {workload_id:?} serves HTTP"),
+            },
+        };
+        dispatch_local(workload_id, request, target, self.local_guest_meter()).await
+    }
+
     /// Returns the actual bound address (useful when binding to port 0).
     pub fn addr(&self) -> SocketAddr {
         self.addr

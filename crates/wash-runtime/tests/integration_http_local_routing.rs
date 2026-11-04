@@ -734,3 +734,78 @@ async fn test_local_routing_p3_matches_a_path_scoped_route() -> Result<()> {
 
     Ok(())
 }
+
+/// Start a host that keeps a handle on its [`Ingress`], so a test can call
+/// [`Ingress::dispatch_request`] directly rather than through the listener.
+async fn start_host_keeping_ingress() -> Result<(
+    Arc<Ingress<DynamicRouter, RefuseOutgoingHandler>>,
+    impl HostApi,
+)> {
+    let ingress = Arc::new(
+        Ingress::builder(DynamicRouter::default(), "127.0.0.1:0".parse()?)
+            .outgoing_handler(RefuseOutgoingHandler)
+            .build()
+            .await?,
+    );
+    let host = HostBuilder::new()
+        .with_engine(Engine::builder().build()?)
+        .with_http_handler(ingress.clone())
+        .with_plugin(Arc::new(TracingLogger::default()))?
+        .with_plugin(Arc::new(DynamicConfig::default()))?
+        .build()?
+        .start()
+        .await
+        .context("Failed to start host")?;
+    Ok((ingress, host))
+}
+
+fn empty_get(uri: &str) -> hyper::Request<WasiBody> {
+    use http_body_util::BodyExt;
+    hyper::Request::get(uri)
+        .body(
+            http_body_util::Empty::<bytes::Bytes>::new()
+                .map_err(|never| match never {})
+                .boxed_unsync(),
+        )
+        .unwrap()
+}
+
+/// `Ingress::dispatch_request` delivers to a resolved workload with no listener
+/// involved, on both the p2 and the p3 component paths, and refuses an id with
+/// no workload behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dispatch_request_delivers_in_process() -> Result<()> {
+    use http_body_util::BodyExt;
+
+    let (ingress, host) = start_host_keeping_ingress().await?;
+
+    for (name, wasm, expected) in [
+        ("callee-p2", CALLEE_WASM, "hello from p2"),
+        ("callee-p3", CALLEE_P3_WASM, "hello from p3"),
+    ] {
+        let request = http_workload(name, wasm, &format!("{name}.test"), &[], &[]);
+        let workload_id = request.workload_id.clone();
+        host.workload_start(request).await?;
+
+        let response = timeout(
+            Duration::from_secs(10),
+            ingress.dispatch_request(&workload_id, empty_get(&format!("http://{name}.test/"))),
+        )
+        .await
+        .context("dispatch_request timed out")??;
+        assert_eq!(response.status(), 200, "{name}");
+        let body = response.into_body().collect().await?.to_bytes();
+        assert_eq!(body, expected.as_bytes(), "{name}");
+    }
+
+    let err = ingress
+        .dispatch_request("no-such-workload", empty_get("http://nobody.test/"))
+        .await
+        .expect_err("an unbound workload id must be refused");
+    assert!(
+        err.to_string().contains("no workload bound"),
+        "unexpected error: {err}"
+    );
+
+    Ok(())
+}
