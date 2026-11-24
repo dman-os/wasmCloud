@@ -80,6 +80,13 @@ pub(crate) async fn handle_component_request_p3(
     // returns it, while the body is still streaming.
     let (parts_tx, parts_rx) =
         tokio::sync::oneshot::channel::<anyhow::Result<hyper::http::response::Parts>>();
+    // Carries the error `run_concurrent` fails with (a guest trap that unwinds
+    // the whole store rather than returning from the handler) out to the
+    // caller still waiting on the head, so the caller sees the trap with its
+    // `WasmBacktrace` and not just that the task ended. It stays a
+    // `wasmtime::Error` converted with `anyhow::Error::from`, which keeps its
+    // context layers (the `WasmBacktrace` among them), not flattened to text.
+    let (run_failed_tx, run_failed_rx) = tokio::sync::oneshot::channel::<wasmtime::Error>();
 
     // The store is owned by this task for the entire response lifetime.
     // `run_concurrent` only resolves once every frame has been forwarded, so the
@@ -143,8 +150,9 @@ pub(crate) async fn handle_component_request_p3(
                                     )
                                 });
                                 if let Some(tx) = parts_tx.take() {
-                                    let _ =
-                                        tx.send(Err(anyhow::anyhow!(e).context("P3 handler trap")));
+                                    let _ = tx.send(Err(
+                                        anyhow::Error::from(e).context("P3 handler trap")
+                                    ));
                                 }
                                 return Ok(());
                             }
@@ -228,6 +236,9 @@ pub(crate) async fn handle_component_request_p3(
                 Err(e) => {
                     tracing::error!(err = ?e, "P3 run_concurrent failed");
                     crate::engine::trap_remediation::note_guest_fault(store.data(), &e);
+                    // Nothing is waiting once the head was delivered or the
+                    // caller went away; the error is logged above either way.
+                    let _ = run_failed_tx.send(e);
                 }
             }
             drop(store);
@@ -235,9 +246,16 @@ pub(crate) async fn handle_component_request_p3(
         .in_current_span(),
     ));
 
-    let head = parts_rx
-        .await
-        .map_err(|_| anyhow::anyhow!("P3 component task ended before producing a response"))??;
+    let head = match parts_rx.await {
+        Ok(head) => head?,
+        Err(_) => {
+            return Err(match run_failed_rx.await {
+                Ok(error) => anyhow::Error::from(error)
+                    .context("P3 component task failed before producing a response"),
+                Err(_) => anyhow::anyhow!("P3 component task ended before producing a response"),
+            });
+        }
+    };
     let body: WasiBody = ChannelBody {
         rx: frame_rx,
         _task: task,
