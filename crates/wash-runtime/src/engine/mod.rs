@@ -256,6 +256,32 @@ mod value;
 mod volumes;
 pub mod workload;
 
+/// The embedder's source of a guest's standard output and error.
+///
+/// Installed with [`EngineBuilder::with_guest_stdio`]. A store's WASI context
+/// is built once per request store (and per ephemeral linked call), so these
+/// are called per store, not once per workload: an implementation keeps its
+/// per-workload state (a line buffer, a ring of recent output) behind the
+/// returned stream and hands every store of a (workload, component) the same
+/// logical sink, as [`wasmtime_wasi::cli::StdoutStream`] requires.
+///
+/// Returning `None` leaves that stream inherited from the host process.
+pub trait GuestStdio: Send + Sync {
+    /// The sink for `component_id`'s stdout in `workload_id`.
+    fn stdout(
+        &self,
+        workload_id: &str,
+        component_id: &str,
+    ) -> Option<Box<dyn wasmtime_wasi::cli::StdoutStream + Sync>>;
+
+    /// The sink for `component_id`'s stderr in `workload_id`.
+    fn stderr(
+        &self,
+        workload_id: &str,
+        component_id: &str,
+    ) -> Option<Box<dyn wasmtime_wasi::cli::StdoutStream + Sync>>;
+}
+
 /// How often the engine's epoch advances.
 ///
 /// This is the resolution of the deadline checks compiled into every guest, not
@@ -337,6 +363,9 @@ pub struct Engine {
     /// the host's port table, and the connection budget. The workload-level half
     /// (`allowedHosts`, `allowedHostLoopbackPorts`) is layered over it per component.
     pub(crate) socket_policy: Arc<crate::sockets::policy::SocketPolicy>,
+    /// The embedder's source of guest stdout/stderr; `None` inherits the
+    /// host process's streams. See [`GuestStdio`].
+    guest_stdio: Option<Arc<dyn GuestStdio>>,
     /// Which host paths a workload's `hostPath` volume may name.
     host_paths: volumes::HostPathPolicy,
     /// Where `emptyDir` volumes live. An error when the root could not be
@@ -833,6 +862,7 @@ impl Engine {
         );
         service.metadata.resolved_volume_mounts = resolved_volume_mounts;
         service.metadata.socket_policy = Arc::clone(&self.socket_policy);
+        service.metadata.guest_stdio = self.guest_stdio.clone();
         service.metadata.guest_memory = Arc::clone(&self.guest_memory);
         service.metadata.compiled = compiled;
 
@@ -998,6 +1028,7 @@ impl Engine {
         );
         workload_component.metadata.resolved_volume_mounts = resolved_volume_mounts;
         workload_component.metadata.socket_policy = Arc::clone(&self.socket_policy);
+        workload_component.metadata.guest_stdio = self.guest_stdio.clone();
         workload_component.metadata.guest_memory = Arc::clone(&self.guest_memory);
         workload_component.metadata.compiled = compiled;
         Ok(workload_component)
@@ -1210,6 +1241,7 @@ pub struct EngineBuilder {
     parallel_compilation: Option<bool>,
     native_unwind_info: Option<bool>,
     socket_policy: Option<Arc<crate::sockets::policy::SocketPolicy>>,
+    guest_stdio: Option<Arc<dyn GuestStdio>>,
     reserved_host_paths: Vec<PathBuf>,
     allowed_host_paths: Vec<PathBuf>,
     scratch_root: Option<PathBuf>,
@@ -1269,6 +1301,18 @@ impl EngineBuilder {
     #[must_use]
     pub fn with_socket_policy(mut self, policy: Arc<crate::sockets::policy::SocketPolicy>) -> Self {
         self.socket_policy = Some(policy);
+        self
+    }
+
+    /// Route every workload's guest stdout and stderr through `stdio`
+    /// instead of inheriting the host process's streams.
+    ///
+    /// [`GuestStdio`] is consulted each time a store's WASI context is built,
+    /// so it can decline (return `None`) for a stream it does not capture and
+    /// that stream is inherited as before.
+    #[must_use]
+    pub fn with_guest_stdio(mut self, stdio: Arc<dyn GuestStdio>) -> Self {
+        self.guest_stdio = Some(stdio);
         self
     }
 
@@ -1714,6 +1758,7 @@ impl EngineBuilder {
                 socket_policy.meters.clone(),
             ),
             socket_policy,
+            guest_stdio: self.guest_stdio,
             scratch,
             host_memory,
             guest_memory: {

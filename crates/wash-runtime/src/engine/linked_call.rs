@@ -84,6 +84,8 @@ pub(crate) struct ComponentCtxTemplate {
     /// `allowedHostLoopbackPorts`) comes from `local_resources` and is layered over
     /// this when the check is built.
     socket_policy: Arc<crate::sockets::policy::SocketPolicy>,
+    /// The embedder's stdout/stderr for this component, if it supplied any.
+    guest_stdio: Option<Arc<dyn crate::engine::GuestStdio>>,
     /// The host-wide guest memory budget this component's stores draw on.
     guest_memory: Arc<crate::engine::guest_memory::GuestMemoryBudget>,
     /// The workload deploy's trap-hint flag.
@@ -102,6 +104,7 @@ impl ComponentCtxTemplate {
             plugins: metadata.plugins.clone(),
             loopback: metadata.loopback.clone(),
             socket_policy: metadata.socket_policy.clone(),
+            guest_stdio: metadata.guest_stdio.clone(),
             guest_memory: metadata.guest_memory.clone(),
             trap_hint_logged: metadata.trap_hint_logged.clone(),
             #[cfg(feature = "wasi-tls")]
@@ -300,7 +303,17 @@ async fn build_ctx_from_template(
 ) -> anyhow::Result<Ctx> {
     let mut wasi_ctx_builder = WasiCtxBuilder::new();
     apply_environment(&mut wasi_ctx_builder, &template.local_resources.environment);
-    wasi_ctx_builder.inherit_stdout().inherit_stderr();
+    // A stream the embedder's `GuestStdio` declines (or every stream, when it
+    // set none) is inherited from the host process, as upstream does.
+    let stdio = template.guest_stdio.as_deref();
+    match stdio.and_then(|stdio| stdio.stdout(&template.workload_id, &template.component_id)) {
+        Some(stdout) => wasi_ctx_builder.stdout(stdout),
+        None => wasi_ctx_builder.inherit_stdout(),
+    };
+    match stdio.and_then(|stdio| stdio.stderr(&template.workload_id, &template.component_id)) {
+        Some(stderr) => wasi_ctx_builder.stderr(stderr),
+        None => wasi_ctx_builder.inherit_stderr(),
+    };
 
     let kind = if is_service {
         sockets::policy::GuestKind::Service

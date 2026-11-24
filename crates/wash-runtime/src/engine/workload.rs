@@ -165,6 +165,9 @@ pub struct WorkloadMetadata {
     /// from [`crate::engine::Engine`]'s configuration; the workload-level half
     /// (`allowedHosts`, `allowedHostLoopbackPorts`) comes from `local_resources`.
     pub(crate) socket_policy: Arc<crate::sockets::policy::SocketPolicy>,
+    /// The embedder's stdout/stderr for this component, installed by the
+    /// engine; `None` keeps the guest inheriting the host process's streams.
+    pub(crate) guest_stdio: Option<Arc<dyn crate::engine::GuestStdio>>,
     /// The host-wide guest memory budget every store built for this component
     /// draws on. Installed by the engine alongside `socket_policy`; the
     /// [`Default`] here is an unmetered budget, so a metadata built outside an
@@ -495,6 +498,7 @@ impl WorkloadService {
                 plugins: None,
                 loopback,
                 socket_policy: Arc::default(),
+                guest_stdio: None,
                 guest_memory: Arc::default(),
                 trap_hint_logged: Arc::default(),
                 linked_components: Default::default(),
@@ -616,6 +620,7 @@ impl WorkloadComponent {
                 plugins: None,
                 loopback,
                 socket_policy: Arc::default(),
+                guest_stdio: None,
                 guest_memory: Arc::default(),
                 trap_hint_logged: Arc::default(),
                 linked_components: Default::default(),
